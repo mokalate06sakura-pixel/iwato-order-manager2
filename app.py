@@ -65,11 +65,21 @@ def forward_fill_cols(df, cols):
     return df
 
 def read_excel_flexible(file_like, header_row):
-    """BytesIOからでも確実に読む。header_rowは1始まり → pandasは0始まり。"""
+    """BytesIOからでも確実に読む（2行ヘッダー対応）。header_rowは1始まり。"""
     hdr = max(0, header_row - 1)
-    df = pd.read_excel(file_like, header=hdr)
-    df.columns = df.columns.astype(str).str.strip().str.replace("\n", "", regex=False)
+    try:
+        # 🔹 2行ヘッダーを一体化して読み込み
+        df = pd.read_excel(file_like, header=[hdr, hdr + 1])
+        df.columns = [
+            ''.join([str(c) for c in col if str(c) != 'nan']).replace('Unnamed: ', '').strip()
+            for col in df.columns
+        ]
+    except Exception:
+        # 🔹 フォールバック（1行ヘッダー）
+        df = pd.read_excel(file_like, header=hdr)
+        df.columns = df.columns.astype(str).str.strip().str.replace("\n", "", regex=False)
     return df
+
 
 def to_excel_bytes(df, startrow=0):
     bio = io.BytesIO()
@@ -226,5 +236,6 @@ with st.expander("STEP 2：仕入先別 注文書を作成（ZIP）", expanded=T
             )
         except Exception as e:
             st.error(f"❌ 作成中にエラー：{e}")
+
 
 
