@@ -1,18 +1,21 @@
 import io, zipfile, datetime
 import pandas as pd
 import streamlit as st
+from io import BytesIO
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.worksheet.page import PageMargins
 
+# 画面設定
 st.set_page_config(page_title="いわと発注管理", layout="centered")
 
+# 共通スタイル
 TITLE = "いわと発注管理"
-LEFT_HEADER_FONT  = Font(name="ＭＳ ゴシック", size=28, bold=True)
-CENTER_HEADER_FONT= Font(name="ＭＳ ゴシック", size=26, bold=True)
-RIGHT_HEADER_FONT = Font(name="ＭＳ ゴシック", size=24, bold=True)
-BODY_FONT         = Font(name="ＭＳ ゴシック", size=22)
-THIN = Side(border_style="thin", color="000000")
+LEFT_HEADER_FONT   = Font(name="ＭＳ ゴシック", size=28, bold=True)
+CENTER_HEADER_FONT = Font(name="ＭＳ ゴシック", size=26, bold=True)
+RIGHT_HEADER_FONT  = Font(name="ＭＳ ゴシック", size=24, bold=True)
+BODY_FONT          = Font(name="ＭＳ ゴシック", size=22)
+THIN               = Side(border_style="thin", color="000000")
 
 def style_sheet(ws):
     # 本文フォント・罫線・行高
@@ -61,10 +64,10 @@ def forward_fill_cols(df, cols):
             df[c] = df[c].ffill()
     return df
 
-def read_excel_flexible(file, header_row):
-    # header_row は 1始まり想定 → pandasは0始まり
+def read_excel_flexible(file_like, header_row):
+    """BytesIOからでも確実に読む。header_rowは1始まり → pandasは0始まり。"""
     hdr = max(0, header_row - 1)
-    df = pd.read_excel(file, header=hdr)
+    df = pd.read_excel(file_like, header=hdr)
     df.columns = df.columns.astype(str).str.strip().str.replace("\n", "", regex=False)
     return df
 
@@ -76,7 +79,7 @@ def to_excel_bytes(df, startrow=0):
     return bio.getvalue()
 
 def output_order_excels_zip(df, facility):
-    # 列の標準名を想定に寄せる（多少の揺れ吸収）
+    # 列名ゆらぎを吸収
     rename_map = {}
     for c in df.columns:
         cc = str(c)
@@ -90,6 +93,11 @@ def output_order_excels_zip(df, facility):
         if "備考"   in cc: rename_map[c] = "備考欄"
         if "納品時間" in cc: rename_map[c] = "納品時間"
         if "検収" in cc: rename_map[c] = "検収者"
+        if "鮮度" in cc: rename_map[c] = "鮮度"
+        if "品温" in cc: rename_map[c] = "品温"
+        if "異物" in cc: rename_map[c] = "異物"
+        if "包装" in cc: rename_map[c] = "包装"
+        if "期限" in cc: rename_map[c] = "期限"
     df = df.rename(columns=rename_map)
 
     # 欠損補完と型
@@ -98,7 +106,7 @@ def output_order_excels_zip(df, facility):
         for c in ["入所者","職員"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    else:  # ユーハウス
+    else:
         if "ユーハウス入所者" in df.columns:
             df["ユーハウス入所者"] = pd.to_numeric(df["ユーハウス入所者"], errors="coerce").fillna(0)
 
@@ -106,7 +114,8 @@ def output_order_excels_zip(df, facility):
         raise ValueError("「仕入先」列が見つかりません。ヘッダー行の指定を見直してください。")
 
     suppliers = df["仕入先"].dropna().unique()
-    # 固定の列順（施設別で数量列が変わる）
+
+    # 固定の列順（施設別）
     if facility == "いわと":
         keep_cols = ["使用日","食品名","入所者","単位","職員",
                      "鮮度","品温","異物","包装","期限","備考欄","納品時間","検収者"]
@@ -120,40 +129,34 @@ def output_order_excels_zip(df, facility):
         agg = {"ユーハウス入所者":"sum"}
         facility_label = "ユーハウスいわと"
 
-    # ZIPに詰める
+    # ZIPにまとめる
     zip_bytes = io.BytesIO()
     with zipfile.ZipFile(zip_bytes, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for supplier in suppliers:
             sub = df[df["仕入先"] == supplier].copy()
-            # グループ集計
             present_keys = [k for k in group_by if k in sub.columns]
             sub = sub.groupby(present_keys, as_index=False).agg(agg)
-            # 空列補完 → 並び替え
             sub = ensure_columns(sub, keep_cols)
             sub = sub[keep_cols]
 
-            # 一旦Excelへ（startrow=5 でヘッダー余白）
             wb = Workbook()
             ws = wb.active
-            # 先にテーブルを書き込む
-            bio = io.BytesIO()
-            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-                sub.to_excel(writer, index=False, startrow=5)
-            bio.seek(0)
-            tmp_wb = load_workbook(bio)
-            tmp_ws = tmp_wb.active
 
-            # tmp_wsの内容をwsへコピー
+            # テーブル出力（6行目から）
+            tmp = io.BytesIO()
+            with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
+                sub.to_excel(writer, index=False, startrow=5)
+            tmp.seek(0)
+            tmp_wb = load_workbook(tmp)
+            tmp_ws = tmp_wb.active
             for r in tmp_ws.iter_rows(values_only=True):
                 ws.append(list(r))
-            # スタイル＆ヘッダー
+
             style_sheet(ws)
             set_header(ws, str(supplier), facility_label)
 
-            # 仕入先別ファイル名
             safe = str(supplier).replace("/", "_").replace("\\", "_")
             out_name = f"注文書_{safe}_{facility}.xlsx"
-
             out_bio = io.BytesIO()
             wb.save(out_bio)
             out_bio.seek(0)
@@ -162,28 +165,31 @@ def output_order_excels_zip(df, facility):
     zip_bytes.seek(0)
     return zip_bytes.getvalue()
 
-# ====== UI ======
+# ================= UI =================
 st.title(TITLE)
-st.caption("Python / Excel を会社PCに入れずに、ブラウザだけで『検収簿の加工→仕入先別注文書』を作れます。")
+st.caption("ブラウザだけで『検収簿の加工 → 仕入先別注文書（いわと／ユーハウス）』を作成します。")
 
+# ---------- STEP 1：検収簿の加工 ----------
 with st.expander("STEP 1：検収簿の加工（空欄補完付き）", expanded=True):
-    st.write("※ 必要に応じて使います。既に“加工済みファイル”がある場合は STEP 2 へ。")
-    f1 = st.file_uploader("検収記録簿（原本）をアップロード（.xlsx）", type=["xlsx"], key="raw")
+    uploaded_raw = st.file_uploader("検収記録簿（原本 .xlsx）をアップロード", type=["xlsx"], key="raw")
     header_row = st.number_input("ヘッダー（見出し）の行番号（1始まり）", min_value=1, value=1, step=1)
     cols_to_ffill = st.multiselect(
         "下方向にコピー（空欄補完）する列名",
-        options=["納品日","使用日","朝昼夕","仕入先"],
-        default=["使用日","仕入先","食品名"] if False else ["納品日","使用日","朝昼夕","仕入先"]
+        options=["納品日","使用日","朝昼夕","仕入先","食品名"],
+        default=["納品日","使用日","朝昼夕","仕入先"]
     )
-    if st.button("加工する ▶", use_container_width=True, disabled=(f1 is None)):
+
+    if st.button("加工する ▶", use_container_width=True, disabled=(uploaded_raw is None)):
         try:
-            df_raw = read_excel_flexible(f1, header_row)
-            # 利便性のため、食品名カラム名ゆらぎも吸収
-            # → ここでは最小限：列名の改行/空白を除去済み
+            # ←←← 重要：BytesIOで“確実に”読み込む
+            raw_bytes = uploaded_raw.read()
+            raw_excel = BytesIO(raw_bytes)
+
+            df_raw = read_excel_flexible(raw_excel, header_row)
             df_proc = forward_fill_cols(df_raw, cols_to_ffill)
-            # ダウンロード
+
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.success("加工が完了しました。ダウンロードしてください。")
+            st.success("✅ 加工が完了しました。ダウンロードしてください。")
             st.download_button(
                 label="加工済ファイルをダウンロード",
                 data=to_excel_bytes(df_proc, startrow=0),
@@ -192,24 +198,25 @@ with st.expander("STEP 1：検収簿の加工（空欄補完付き）", expanded
                 use_container_width=True
             )
         except Exception as e:
-            st.error(f"加工中にエラー：{e}")
+            st.error(f"❌ 加工中にエラー：{e}")
 
 st.markdown("---")
 
+# ---------- STEP 2：仕入先別 注文書 ----------
 with st.expander("STEP 2：仕入先別 注文書を作成（ZIP）", expanded=True):
-    f2 = st.file_uploader("加工済ファイルをアップロード（.xlsx）", type=["xlsx"], key="proc")
-    facility = st.radio(
-        "施設を選択",
-        options=["いわと","ユーハウス"],
-        horizontal=True
-    )
+    uploaded_proc = st.file_uploader("加工済ファイル（.xlsx）をアップロード", type=["xlsx"], key="proc")
+    facility = st.radio("施設を選択", options=["いわと","ユーハウス"], horizontal=True)
     st.caption("出力仕様：A4横／MSゴシック22pt／行高30／細罫線／ヘッダー（左：御中／中央：施設名／右：(有)ハートミール）／検収者列あり")
-    if st.button("注文書を作成 ▶", use_container_width=True, disabled=(f2 is None)):
+
+    if st.button("注文書を作成 ▶", use_container_width=True, disabled=(uploaded_proc is None)):
         try:
-            df2 = pd.read_excel(f2, header=0)
+            proc_bytes = uploaded_proc.read()
+            proc_excel = BytesIO(proc_bytes)
+
+            df2 = pd.read_excel(proc_excel, header=0)
             zip_data = output_order_excels_zip(df2, facility=facility)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.success("仕入先別の注文書をZIPで用意しました。ダウンロードしてください。")
+            st.success("✅ 仕入先別の注文書をZIPで用意しました。ダウンロードしてください。")
             st.download_button(
                 label="注文書ZIPをダウンロード",
                 data=zip_data,
@@ -218,4 +225,6 @@ with st.expander("STEP 2：仕入先別 注文書を作成（ZIP）", expanded=T
                 use_container_width=True
             )
         except Exception as e:
-            st.error(f"作成中にエラー：{e}")
+            st.error(f"❌ 作成中にエラー：{e}")
+
+
